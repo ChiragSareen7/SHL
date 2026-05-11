@@ -2,18 +2,17 @@ import json
 import logging
 import os
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
-from sentence_transformers import SentenceTransformer
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.metrics.pairwise import cosine_similarity
 
 log = logging.getLogger(__name__)
 
 _catalog: list[dict] = []
-_model: Optional[SentenceTransformer] = None
-_embeddings: Optional[np.ndarray] = None
 _url_set: set[str] = set()
-_EMBED_MODEL = "all-MiniLM-L6-v2"
+_vectorizer: TfidfVectorizer | None = None
+_matrix = None  # sparse TF-IDF matrix
 
 
 def _catalog_path() -> Path:
@@ -37,15 +36,13 @@ def load_catalog() -> list[dict]:
 
 
 def build_index() -> None:
-    global _model, _embeddings
+    global _vectorizer, _matrix
     if not _catalog:
         raise RuntimeError("Catalog not loaded. Call load_catalog() first.")
-    log.info(f"Loading embedding model: {_EMBED_MODEL}")
-    _model = SentenceTransformer(_EMBED_MODEL)
     texts = [_item_to_text(item) for item in _catalog]
-    log.info(f"Encoding {len(texts)} assessments...")
-    _embeddings = _model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
-    log.info("Index ready.")
+    _vectorizer = TfidfVectorizer(ngram_range=(1, 2), min_df=1, sublinear_tf=True)
+    _matrix = _vectorizer.fit_transform(texts)
+    log.info(f"TF-IDF index built: {_matrix.shape[0]} docs, {_matrix.shape[1]} terms.")
 
 
 def _item_to_text(item: dict) -> str:
@@ -59,13 +56,14 @@ def _item_to_text(item: dict) -> str:
 
 
 def semantic_search(query: str, top_k: int = 15) -> list[dict]:
-    if _model is None or _embeddings is None:
+    """TF-IDF cosine similarity search (replaces sentence-transformer embeddings)."""
+    if _vectorizer is None or _matrix is None:
         log.warning("Index not built; falling back to keyword search.")
         return keyword_search(query, top_k)
-    q_emb = _model.encode([query], normalize_embeddings=True)
-    scores = (_embeddings @ q_emb.T).squeeze()
+    q_vec = _vectorizer.transform([query])
+    scores = cosine_similarity(q_vec, _matrix).flatten()
     indices = np.argsort(scores)[::-1][:top_k]
-    return [_catalog[int(i)] for i in indices]
+    return [_catalog[int(i)] for i in indices if scores[i] > 0]
 
 
 def keyword_search(query: str, top_k: int = 15) -> list[dict]:
@@ -92,7 +90,7 @@ def keyword_search(query: str, top_k: int = 15) -> list[dict]:
 
 
 def hybrid_search(query: str, top_k: int = 15) -> list[dict]:
-    """Combine semantic + keyword search via Reciprocal Rank Fusion."""
+    """Combine TF-IDF + keyword search via Reciprocal Rank Fusion."""
     sem_results = semantic_search(query, top_k=top_k)
     kw_results = keyword_search(query, top_k=top_k)
 
